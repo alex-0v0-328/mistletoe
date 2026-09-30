@@ -81,7 +81,7 @@ impl Tables {
             .get("neutral")
             .ok_or("presets.json 缺少 neutral 预设")?
             .complete()
-            .ok_or("presets.json 的 neutral 必须写全所有字段：eyes、mouth 的 shape/width/open/curve、blush、tears、sweat、gloom")?;
+            .ok_or("presets.json 的 neutral 必须写全所有字段：eyes、mouth 的 shape/width/open/curve、blush、tears、sweat、gloom、bubble")?;
         let mut presets = BTreeMap::new();
         for (name, patch) in &file.expressions {
             check_name("预设", name).map_err(|e| format!("presets.json：{e}"))?;
@@ -296,7 +296,7 @@ mod tests {
         assert!(e.contains("开心"), "{e}");
         let e = parse_err(&PRESETS.replace("\"sway\"", "\"swayy\""), TAGS);
         assert!(e.contains("presets.json"), "{e}");
-        let e = parse_err(&PRESETS.replace(", \"gloom\": 0 }", " }"), TAGS);
+        let e = parse_err(&PRESETS.replace(", \"bubble\": 0 }", " }"), TAGS);
         assert!(e.contains("neutral"), "{e}");
     }
 

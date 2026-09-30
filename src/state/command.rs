@@ -33,6 +33,7 @@ pub struct ExpressionArgs {
     pub tears: Option<f32>,
     pub sweat: Option<f32>,
     pub gloom: Option<f32>,
+    pub bubble: Option<f32>,
     pub duration_ms: Option<u32>,
 }
 
@@ -45,6 +46,7 @@ impl ExpressionArgs {
             tears: self.tears,
             sweat: self.sweat,
             gloom: self.gloom,
+            bubble: self.bubble,
         }
     }
 }

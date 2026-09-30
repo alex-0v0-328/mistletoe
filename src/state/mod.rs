@@ -7,24 +7,25 @@ mod command;
 mod expression;
 mod follow;
 mod motion;
+mod swap;
 mod tags;
 
 use serde::Serialize;
 
 use blink::Blinker;
 pub use command::{Command, Reply};
-use expression::{Expression, ExpressionState, Face};
+use expression::Expression;
+pub use expression::{Eyes, Face, MouthShape};
 use follow::Follow;
-use motion::{Motion, MotionReport};
+use motion::{Motion, MotionReport, MotionSpec};
+use swap::Swap;
 pub use tags::Tables;
 
-/// 没给 duration_ms 时的表情过渡时长，以及允许的上限（毫秒）
-const DEFAULT_DURATION_MS: u32 = 200;
+/// 没给 duration_ms 时换表情动画（压扁 → 换 → 弹开）的时长，以及允许的上限（毫秒）
+const DEFAULT_DURATION_MS: u32 = 300;
 const MAX_DURATION_MS: u32 = 10_000;
 /// 颜文字最多多少个字符（Unicode 标量值，组合符号也算一个）
 const MAX_KAOMOJI_CHARS: usize = 64;
-/// 颜文字出现时放大进场的时长（秒）
-const KAOMOJI_IN: f64 = 0.18;
 
 /// 指针相对窗口中心的位置，以半个窗口短边为单位：x 向右、y 向上。
 /// 指针在窗口外时可以超出 ±1，没有上限。
@@ -68,21 +69,15 @@ impl Pose {
     }
 }
 
-/// 颜文字在这一帧的样子
-#[derive(Clone, Debug, PartialEq)]
-pub struct KaomojiView {
-    pub text: String,
-    /// 进场缩放 0..1（没有淡入，只有放大）
-    pub scale: f32,
-}
-
 /// 每帧交给 render 的只读结果。
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub pose: Pose,
     pub face: Face,
-    /// Some 时颜文字替代眼睛和嘴；腮红、眼泪、汗、阴沉脸照常显示
-    pub kaomoji: Option<KaomojiView>,
+    /// Some 时颜文字替代眼睛和嘴；腮红、眼泪、汗、阴沉脸、鼻涕泡照常显示
+    pub kaomoji: Option<String>,
+    /// 球的缩放：换表情时轻微放大一下
+    pub scale: f32,
     /// 还在动：app 需要继续出帧；为 false 时 app 可以睡到 next_wakeup
     pub animating: bool,
     /// 空闲时下一次需要醒来的时刻（下一次自动眨眼）
@@ -102,18 +97,23 @@ pub struct StateReport {
     pub pose: Pose,
 }
 
-struct Kaomoji {
-    text: String,
-    since: f64,
+/// 脸上显示的内容：原生表情 + 可选的颜文字。换表情动画在中点把“显示的”一次性换成“目标”。
+#[derive(Clone, Debug, PartialEq)]
+struct Look {
+    expression: Expression,
+    kaomoji: Option<String>,
 }
 
 pub struct State {
     tables: Tables,
     follow: Follow,
-    expression: ExpressionState,
     blink: Blinker,
     motion: Motion,
-    kaomoji: Option<Kaomoji>,
+    swap: Swap,
+    target: Look,
+    shown: Look,
+    /// 最近一次命令给的换表情时长；弹开阶段目标又变时，下一次动画用它
+    swap_duration: f64,
     /// 最近一帧显示的脸和姿态，get_state 报告的就是它们：用户看到什么，agent 就拿到什么
     shown_face: Face,
     shown_pose: Pose,
@@ -122,15 +122,24 @@ pub struct State {
 impl State {
     /// 从 neutral 表情开始。seed 决定随机眨眼的节奏。
     pub fn new(tables: Tables, seed: u64, now: f64) -> Self {
-        let mut expression = ExpressionState::new(tables.neutral());
-        let shown_face = expression.tick(now);
+        let look = Look {
+            expression: tables.neutral(),
+            kaomoji: None,
+        };
+        let shown_face = Face {
+            expression: look.expression,
+            blink: 0.0,
+            squish: 1.0,
+        };
         Self {
             tables,
             follow: Follow::default(),
-            expression,
             blink: Blinker::new(seed, now),
             motion: Motion::default(),
-            kaomoji: None,
+            swap: Swap::default(),
+            target: look.clone(),
+            shown: look,
+            swap_duration: DEFAULT_DURATION_MS as f64 / 1000.0,
             shown_face,
             shown_pose: Pose::default(),
         }
@@ -151,31 +160,32 @@ impl State {
 
     /// 推进到时间 `now`，返回这一帧的快照。
     pub fn tick(&mut self, now: f64) -> Snapshot {
-        let blink = self.blink.tick(now);
+        let frame = self.swap.tick(now);
+        if frame.swap_now {
+            // 中点：脸压扁到 0 的这一刻换内容，看不出跳变
+            self.shown = self.target.clone();
+        }
+        if frame.finished && self.shown != self.target {
+            // 弹开阶段目标又变了：马上再换一次
+            self.swap.start(self.swap_duration, now);
+        }
         let face = Face {
-            blink,
-            ..self.expression.tick(now)
+            expression: self.shown.expression,
+            blink: self.blink.tick(now),
+            squish: frame.squish,
         };
         let pose = self.follow.tick(now).plus(self.motion.tick(now));
-        let kaomoji = self.kaomoji.as_ref().map(|k| KaomojiView {
-            text: k.text.clone(),
-            scale: smoothstep(((now - k.since) / KAOMOJI_IN) as f32),
-        });
-        let kaomoji_entering = self
-            .kaomoji
-            .as_ref()
-            .is_some_and(|k| now < k.since + KAOMOJI_IN);
         let animating = !self.follow.settled()
             || self.blink.active()
-            || self.expression.animating(now)
-            || self.motion.active()
-            || kaomoji_entering;
+            || self.swap.active()
+            || self.motion.active();
         self.shown_face = face;
         self.shown_pose = pose;
         Snapshot {
             pose,
             face,
-            kaomoji,
+            kaomoji: self.shown.kaomoji.clone(),
+            scale: frame.scale,
             animating,
             next_wakeup: self.blink.next_wakeup(),
         }
@@ -183,11 +193,16 @@ impl State {
 
     /// 所有检查都在修改状态之前做完，保证出错时什么都没变。
     fn try_apply(&mut self, cmd: Command, now: f64) -> Result<Reply, String> {
+        let default_duration = DEFAULT_DURATION_MS as f64 / 1000.0;
         match cmd {
             Command::SetTag { tag } => {
                 let (expression, motion) = self.resolve_tag(&tag)?;
-                self.kaomoji = None;
-                self.apply_tag(expression, motion, now);
+                let look = Look {
+                    expression: expression.unwrap_or(self.target.expression),
+                    kaomoji: None,
+                };
+                self.set_look(look, default_duration, now);
+                self.play(motion, now);
             }
             Command::SetExpression(args) => {
                 let patch = args.patch();
@@ -195,26 +210,26 @@ impl State {
                 let duration = duration_seconds(args.duration_ms)?;
                 let base = match &args.preset {
                     Some(name) => self.tables.preset(name)?,
-                    None => self.expression.target(),
+                    None => self.target.expression,
                 };
-                self.kaomoji = None;
-                self.set_expression(patch.apply_to(base), duration, now);
+                let look = Look {
+                    expression: patch.apply_to(base),
+                    kaomoji: None,
+                };
+                self.set_look(look, duration, now);
             }
             Command::SetKaomoji { text, tag } => {
                 check_kaomoji(&text)?;
-                let resolved = match &tag {
-                    Some(name) => Some(self.resolve_tag(name)?),
-                    None => None,
+                let (expression, motion) = match &tag {
+                    Some(name) => self.resolve_tag(name)?,
+                    None => (None, None),
                 };
-                let same_text = self.kaomoji.as_ref().is_some_and(|k| k.text == text);
-                if text.is_empty() {
-                    self.kaomoji = None;
-                } else if !same_text {
-                    self.kaomoji = Some(Kaomoji { text, since: now });
-                }
-                if let Some((expression, motion)) = resolved {
-                    self.apply_tag(expression, motion, now);
-                }
+                let look = Look {
+                    expression: expression.unwrap_or(self.target.expression),
+                    kaomoji: (!text.is_empty()).then_some(text),
+                };
+                self.set_look(look, default_duration, now);
+                self.play(motion, now);
             }
             Command::PlayMotion(args) => {
                 let spec = self.tables.motion(
@@ -234,10 +249,7 @@ impl State {
         Ok(Reply::Done)
     }
 
-    fn resolve_tag(
-        &self,
-        name: &str,
-    ) -> Result<(Option<Expression>, Option<motion::MotionSpec>), String> {
+    fn resolve_tag(&self, name: &str) -> Result<(Option<Expression>, Option<MotionSpec>), String> {
         let tag = self.tables.tag(name)?;
         let expression = match &tag.expression {
             Some(preset) => Some(self.tables.preset(preset)?),
@@ -246,34 +258,32 @@ impl State {
         Ok((expression, tag.motion))
     }
 
-    /// 标签：有表情就换表情，有动作就播动作；没写的部分保持不变。
-    fn apply_tag(
-        &mut self,
-        expression: Option<Expression>,
-        motion: Option<motion::MotionSpec>,
-        now: f64,
-    ) {
-        if let Some(target) = expression {
-            self.set_expression(target, DEFAULT_DURATION_MS as f64 / 1000.0, now);
-        }
+    fn play(&mut self, motion: Option<MotionSpec>, now: f64) {
         if let Some(spec) = motion {
             self.motion.play(spec, now);
         }
     }
 
-    /// 设表情目标；眼型要换时安排一次眨眼，在眼睛完全闭上的那一刻换。
-    fn set_expression(&mut self, target: Expression, duration: f64, now: f64) {
-        if self.expression.set_target(target, duration, now) {
-            let closed_at = self.blink.request(now);
-            self.expression.swap_eyes_at(closed_at);
+    /// 设新的脸。duration 为 0 立即换；否则整张脸压扁到 0、在中点换、再弹开。
+    /// 动画还没到中点时再改目标，中点直接换成最新的；已过中点则等这次结束后再来一次（见 tick）。
+    fn set_look(&mut self, look: Look, duration: f64, now: f64) {
+        self.target = look;
+        if duration <= 0.0 {
+            self.shown = self.target.clone();
+            self.swap = Swap::default();
+            return;
+        }
+        self.swap_duration = duration;
+        if self.target != self.shown {
+            self.swap.start(duration, now);
         }
     }
 
     fn report(&self, now: f64) -> StateReport {
         StateReport {
-            target: self.expression.target(),
+            target: self.target.expression,
             current: self.shown_face,
-            kaomoji: self.kaomoji.as_ref().map(|k| k.text.clone()),
+            kaomoji: self.target.kaomoji.clone(),
             motion: self.motion.report(now),
             pose: self.shown_pose,
         }
@@ -319,13 +329,8 @@ fn smoothstep(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
 #[cfg(test)]
 mod tests {
-    use super::expression::{Eyes, MouthShape};
     use super::motion::MotionName;
     use super::*;
 
@@ -356,14 +361,14 @@ mod tests {
     fn set_tag_applies_preset_and_motion() {
         let mut s = state();
         ok(&mut s, r#"{"cmd":"set_tag","tag":"happy"}"#, 1.0);
-        assert_eq!(s.expression.target().eyes, Eyes::Smile);
+        assert_eq!(s.target.expression.eyes, Eyes::Smile);
         assert_eq!(
             s.motion.report(1.1).map(|m| m.spec.name),
             Some(MotionName::Bounce)
         );
         // 只有动作的标签不动表情
         ok(&mut s, r#"{"cmd":"set_tag","tag":"no"}"#, 2.0);
-        assert_eq!(s.expression.target().eyes, Eyes::Smile);
+        assert_eq!(s.target.expression.eyes, Eyes::Smile);
         assert_eq!(
             s.motion.report(2.1).map(|m| m.spec.name),
             Some(MotionName::Shake)
@@ -379,7 +384,7 @@ mod tests {
             r#"{"cmd":"set_expression","mouth":{"width":0.6}}"#,
             0.1,
         );
-        let t = s.expression.target();
+        let t = s.target.expression;
         assert_eq!((t.blush, t.mouth.width), (1.0, 0.6));
         // 带 preset 时从 neutral + 预设重新开始，再叠加字段
         ok(
@@ -387,14 +392,14 @@ mod tests {
             r#"{"cmd":"set_expression","preset":"smile","tears":0.5}"#,
             0.2,
         );
-        let t = s.expression.target();
+        let t = s.target.expression;
         assert_eq!((t.eyes, t.blush, t.tears), (Eyes::Smile, 0.0, 0.5));
     }
 
     #[test]
     fn invalid_commands_change_nothing() {
         let mut s = state();
-        let before = s.expression.target();
+        let before = s.target.clone();
         for (json, needle) in [
             (r#"{"cmd":"set_tag","tag":"dance"}"#, "dance"),
             (
@@ -426,66 +431,87 @@ mod tests {
             let e = error(&mut s, json, 1.0);
             assert!(e.contains(needle), "{json} → {e}");
         }
-        assert_eq!(s.expression.target(), before);
-        assert!(s.kaomoji.is_none());
+        assert_eq!(s.target, before);
+        assert!(!s.swap.active());
         assert!(!s.motion.active());
     }
 
     #[test]
-    fn eye_shape_swaps_only_while_eyes_are_closed() {
-        let mut s = state();
-        ok(&mut s, r#"{"cmd":"set_tag","tag":"happy"}"#, 1.0);
-        let f = s.tick(1.03).face;
-        assert_eq!(f.eyes, Eyes::Dot);
-        assert!(f.blink > 0.0 && f.blink < 1.0);
-        let f = s.tick(1.06).face;
-        assert_eq!(f.eyes, Eyes::Smile);
-        assert!(f.blink > 0.99, "换眼型时眼睛应该是闭着的：{}", f.blink);
-        let f = s.tick(1.2).face;
-        assert_eq!((f.eyes, f.blink), (Eyes::Smile, 0.0));
-    }
-
-    #[test]
-    fn transition_starts_on_the_next_frame() {
+    fn face_swaps_at_the_midpoint_while_squished_flat() {
         let mut s = state();
         s.tick(1.0);
-        ok(
-            &mut s,
-            r#"{"cmd":"set_expression","blush":1,"mouth":{"shape":"cat"}}"#,
-            1.0,
+        ok(&mut s, r#"{"cmd":"set_tag","tag":"happy"}"#, 1.0);
+        // 默认 300 ms：前 40%（120 ms）压扁，中点换，之后弹开
+        let snap = s.tick(1.06);
+        assert_eq!(snap.face.expression.eyes, Eyes::Dot);
+        assert!(snap.face.squish > 0.0 && snap.face.squish < 1.0);
+        let snap = s.tick(1.12);
+        assert_eq!(snap.face.expression.eyes, Eyes::Smile);
+        assert!(
+            snap.face.squish.abs() < 1e-3,
+            "换的那一刻脸是扁的：{}",
+            snap.face.squish
         );
-        let f = s.tick(1.0 + 1.0 / 60.0).face;
-        assert!(f.blush > 0.0 && f.blush < 1.0);
-        assert!(f.mouth_flat > 0.0);
-        let f = s.tick(1.3).face;
-        assert_eq!(
-            (f.blush, f.mouth.shape, f.mouth_flat),
-            (1.0, MouthShape::Cat, 0.0)
-        );
+        assert!(snap.scale > 1.0, "球轻微放大");
+        let snap = s.tick(1.3);
+        assert_eq!((snap.face.squish, snap.scale), (1.0, 1.0));
     }
 
     #[test]
-    fn kaomoji_keeps_overlays_and_native_commands_leave_it() {
+    fn retarget_before_midpoint_swaps_once_after_it_swaps_again() {
+        let mut s = state();
+        ok(&mut s, r#"{"cmd":"set_tag","tag":"happy"}"#, 0.0);
+        s.tick(0.05);
+        ok(&mut s, r#"{"cmd":"set_tag","tag":"sad"}"#, 0.05);
+        // 还没到中点：中点直接换成最新的 sad
+        assert_eq!(s.tick(0.13).face.expression.eyes, Eyes::Sad);
+        ok(&mut s, r#"{"cmd":"set_tag","tag":"scared"}"#, 0.2);
+        // 已过中点：这次弹开结束后再压扁一次，再换
+        assert_eq!(s.tick(0.25).face.expression.eyes, Eyes::Sad);
+        s.tick(0.3);
+        assert_eq!(s.tick(0.42).face.expression.eyes, Eyes::Wide);
+    }
+
+    #[test]
+    fn zero_duration_switches_at_once() {
+        let mut s = state();
+        ok(
+            &mut s,
+            r#"{"cmd":"set_expression","eyes":"wide","duration_ms":0}"#,
+            0.0,
+        );
+        let snap = s.tick(0.0);
+        assert_eq!(
+            (snap.face.expression.eyes, snap.face.squish),
+            (Eyes::Wide, 1.0)
+        );
+        assert!(!s.swap.active());
+    }
+
+    #[test]
+    fn kaomoji_swaps_in_at_the_midpoint_and_native_commands_leave_it() {
         let mut s = state();
         ok(
             &mut s,
             r#"{"cmd":"set_kaomoji","text":"(•̀ᴗ•́)","tag":"scared"}"#,
             0.0,
         );
-        let snap = s.tick(0.09);
-        let k = snap.kaomoji.unwrap();
-        assert_eq!(k.text, "(•̀ᴗ•́)");
-        assert!(k.scale > 0.0 && k.scale < 1.0);
-        assert_eq!(s.expression.target().sweat, 1.0);
-        assert_eq!(s.tick(1.0).kaomoji.map(|k| k.scale), Some(1.0));
-        // 同样的文字再发一次不重新进场
+        assert!(s.tick(0.06).kaomoji.is_none());
+        assert_eq!(s.tick(0.13).kaomoji.as_deref(), Some("(•̀ᴗ•́)"));
+        // 颜文字只替代眼睛和嘴，叠加层照常
+        assert_eq!(s.shown.expression.sweat, 1.0);
+        s.tick(0.4);
+        // 同样的文字再发一次：没有变化，不重新压扁
         ok(&mut s, r#"{"cmd":"set_kaomoji","text":"(•̀ᴗ•́)"}"#, 1.0);
-        assert_eq!(s.tick(1.01).kaomoji.map(|k| k.scale), Some(1.0));
+        assert!(!s.swap.active());
         ok(&mut s, r#"{"cmd":"set_tag","tag":"happy"}"#, 2.0);
-        assert!(s.tick(2.0).kaomoji.is_none());
+        s.tick(2.2);
+        assert!(s.tick(2.4).kaomoji.is_none());
         ok(&mut s, r#"{"cmd":"set_kaomoji","text":"(^_^)"}"#, 3.0);
-        ok(&mut s, r#"{"cmd":"set_kaomoji","text":""}"#, 3.1);
-        assert!(s.tick(3.1).kaomoji.is_none());
+        s.tick(3.4);
+        ok(&mut s, r#"{"cmd":"set_kaomoji","text":""}"#, 4.0);
+        s.tick(4.2);
+        assert!(s.tick(4.4).kaomoji.is_none());
     }
 
     #[test]
@@ -506,7 +532,7 @@ mod tests {
         ok(&mut s, r#"{"cmd":"set_tag","tag":"neutral"}"#, 3.0);
         s.tick(3.2);
         assert!(!s.motion.active());
-        assert_eq!(s.expression.target(), s.tables.neutral());
+        assert_eq!(s.target.expression, s.tables.neutral());
     }
 
     #[test]
@@ -551,13 +577,15 @@ mod tests {
         let json = serde_json::to_value(&*r).unwrap();
         assert_eq!(json["motion"]["loop"], false);
         assert_eq!(json["target"]["eyes"], "dot");
+        assert_eq!(json["current"]["squish"], 1.0);
 
         let Reply::Tags(t) = run(&mut s, r#"{"cmd":"list_tags"}"#, 0.3) else {
             panic!("list_tags 应该返回标签表");
         };
         let json = serde_json::to_value(&*t).unwrap();
         assert_eq!(json["tags"]["scared"]["motion"]["name"], "tremble");
-        assert_eq!(json["eyes"].as_array().map(Vec::len), Some(6));
+        assert_eq!(json["eyes"].as_array().map(Vec::len), Some(7));
+        assert_eq!(json["mouths"].as_array().map(Vec::len), Some(5));
         assert_eq!(json["motions"].as_array().map(Vec::len), Some(6));
         assert!(
             json["presets"]

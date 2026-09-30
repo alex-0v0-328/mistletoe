@@ -1,14 +1,16 @@
 //! wgpu 渲染：一个全屏三角形 + 片元着色器画出整个球。
 //! 只读 state::Snapshot；不认识 api，也不认识 winit（窗口以 wgpu::SurfaceTarget 传进来）。
 
-use crate::state::{Pose, Snapshot};
+use crate::state::{Eyes, MouthShape, Pose, Snapshot};
 
 /// 球半径占窗口短边的比例：直径约为短边的 46%。
 const RADIUS_RATIO: f32 = 0.228;
-/// 描边宽度（物理像素），与窗口大小无关。
-const OUTLINE_PX: f32 = 4.0;
-/// Globals 的字节数：5 个 vec4<f32>。
-const GLOBALS_SIZE: usize = 5 * 16;
+/// 外轮廓宽度：球半径的倍数（和原型一样随球一起缩放）
+const OUTLINE: f32 = 0.04;
+/// 眼神：球转过 1 弧度时，眼睛在脸空间里额外偏移多少（嘴偏移它的 0.6 倍，在着色器里算）
+const LOOK_GAIN: f32 = 0.07;
+/// Globals 的字节数：9 个 vec4<f32>。
+const GLOBALS_SIZE: usize = 9 * 16;
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -35,8 +37,9 @@ impl Renderer {
             .create_surface(target)
             .map_err(|e| format!("创建窗口表面失败：{e}"))?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            // 省电优先：有核显就用核显，空闲时几乎不占资源
-            power_preference: wgpu::PowerPreference::LowPower,
+            // 不排序：wgpu 直接用 DXGI 的第 0 块显卡，也就是接着主显示器的那块。
+            // 这样画面不用跨显卡拷贝（跨显卡时实测偶尔出现横向残片）；普通笔记本上它就是核显，照样省电。
+            power_preference: wgpu::PowerPreference::None,
             compatible_surface: Some(&surface),
             ..Default::default()
         }))
@@ -157,7 +160,7 @@ impl Renderer {
         let Some(frame) = self.acquire_frame() else {
             return;
         };
-        let globals = Globals::new(self.config.width, self.config.height, snapshot.pose);
+        let globals = Globals::new(self.config.width, self.config.height, snapshot);
         self.queue
             .write_buffer(&self.globals_buffer, 0, &globals.to_bytes());
 
@@ -216,7 +219,7 @@ impl Renderer {
 
 /// 每帧上传的 uniform，对应 ball.wgsl 里的 Globals。
 struct Globals {
-    /// 宽、高（物理像素）、球半径（像素）、描边宽度（像素）
+    /// 宽、高（物理像素）、球半径（像素，已含换表情时的放大）、外轮廓宽度（球半径的倍数）
     screen: [f32; 4],
     /// 球心相对窗口中心的位移（像素，x 向右、y 向上），后两项未用
     ball: [f32; 4],
@@ -224,20 +227,40 @@ struct Globals {
     face_u: [f32; 4],
     face_v: [f32; 4],
     face_f: [f32; 4],
+    /// 眼型编号、睁眼程度（1 睁开 .. 0 闭上）、嘴型编号、脸的竖直缩放（编号见 eye_code / mouth_code）
+    expr: [f32; 4],
+    /// 嘴宽、张开、弯曲，最后一项未用
+    mouth: [f32; 4],
+    /// 腮红、眼泪、汗、阴沉脸的显现程度
+    overlay: [f32; 4],
+    /// 鼻涕泡的显现程度、眼神偏移 x、y（脸空间），最后一项未用
+    extra: [f32; 4],
 }
 
 impl Globals {
-    fn new(width: u32, height: u32, pose: Pose) -> Self {
+    fn new(width: u32, height: u32, snapshot: &Snapshot) -> Self {
         let (w, h) = (width as f32, height as f32);
-        let radius = RADIUS_RATIO * w.min(h);
+        let radius = RADIUS_RATIO * w.min(h) * snapshot.scale;
+        let pose = snapshot.pose;
         let [u, v, f] = face_basis(pose);
+        let e = &snapshot.face.expression;
         Self {
-            screen: [w, h, radius, OUTLINE_PX],
+            screen: [w, h, radius, OUTLINE],
             // Pose 的位移以球半径为单位
             ball: [pose.x * radius, pose.y * radius, 0.0, 0.0],
             face_u: [u[0], u[1], u[2], 0.0],
             face_v: [v[0], v[1], v[2], 0.0],
             face_f: [f[0], f[1], f[2], 0.0],
+            expr: [
+                eye_code(e.eyes),
+                1.0 - snapshot.face.blink,
+                mouth_code(e.mouth.shape),
+                snapshot.face.squish,
+            ],
+            mouth: [e.mouth.width, e.mouth.open, e.mouth.curve, 0.0],
+            overlay: [e.blush, e.tears, e.sweat, e.gloom],
+            // 眼神跟着转动方向多偏一点，产生轻微的立体感
+            extra: [e.bubble, pose.yaw * LOOK_GAIN, pose.pitch * LOOK_GAIN, 0.0],
         }
     }
 
@@ -250,11 +273,39 @@ impl Globals {
             self.face_u,
             self.face_v,
             self.face_f,
+            self.expr,
+            self.mouth,
+            self.overlay,
+            self.extra,
         ];
         for (i, value) in fields.iter().flatten().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
         out
+    }
+}
+
+/// 眼型在着色器里的编号，必须和 ball.wgsl 的 eye_sd 对应
+fn eye_code(eyes: Eyes) -> f32 {
+    match eyes {
+        Eyes::Dot => 0.0,
+        Eyes::Smile => 1.0,
+        Eyes::Closed => 2.0,
+        Eyes::Squint => 3.0,
+        Eyes::Wide => 4.0,
+        Eyes::Sad => 5.0,
+        Eyes::Annoyed => 6.0,
+    }
+}
+
+/// 嘴型在着色器里的编号，必须和 ball.wgsl 的 mouth_sd 对应
+fn mouth_code(shape: MouthShape) -> f32 {
+    match shape {
+        MouthShape::Line => 0.0,
+        MouthShape::Cat => 1.0,
+        MouthShape::Triangle => 2.0,
+        MouthShape::Wavy => 3.0,
+        MouthShape::Grin => 4.0,
     }
 }
 
@@ -309,19 +360,40 @@ mod tests {
 
     #[test]
     fn globals_bytes_follow_field_order() {
-        let pose = Pose {
-            y: 0.5,
-            ..Pose::default()
-        };
-        let bytes = Globals::new(800, 600, pose).to_bytes();
+        // 从真实状态拿一帧快照，再把每个字段改成不同的值，检查它们落在正确的位置
+        let tables = crate::state::Tables::parse(
+            include_str!("../../data/presets.json"),
+            include_str!("../../data/tags.json"),
+        )
+        .unwrap();
+        let mut snap = crate::state::State::new(tables, 1, 0.0).tick(0.0);
+        snap.pose.y = 0.5;
+        snap.pose.yaw = 0.5;
+        snap.scale = 1.5;
+        snap.face.blink = 0.75;
+        snap.face.squish = 0.25;
+        let e = &mut snap.face.expression;
+        e.eyes = Eyes::Wide;
+        e.mouth.shape = MouthShape::Grin;
+        (e.mouth.width, e.mouth.open, e.mouth.curve) = (0.3, 0.4, -0.5);
+        (e.blush, e.tears, e.sweat, e.gloom, e.bubble) = (0.1, 0.2, 0.3, 0.4, 0.5);
+        let bytes = Globals::new(800, 600, &snap).to_bytes();
         let read = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-        let radius = RADIUS_RATIO * 600.0;
-        assert_eq!(read(0), 800.0);
-        assert_eq!(read(1), 600.0);
-        assert_eq!(read(2), radius);
+        let radius = RADIUS_RATIO * 600.0 * 1.5;
+        assert_eq!(
+            [read(0), read(1), read(2), read(3)],
+            [800.0, 600.0, radius, OUTLINE]
+        );
         assert_eq!(read(5), 0.5 * radius); // 球心上移半个半径
-        assert_eq!(read(8), 1.0); // U = x̂
-        assert_eq!(read(13), 1.0); // V = ŷ
-        assert_eq!(read(18), 1.0); // F = ẑ
+        assert_eq!(read(13), 1.0); // V = ŷ（只有 yaw，没有 pitch）
+        let expr_and_after: Vec<f32> = (20..36).map(read).collect();
+        let look_x = 0.5 * LOOK_GAIN;
+        assert_eq!(
+            expr_and_after,
+            [
+                4.0, 0.25, 4.0, 0.25, 0.3, 0.4, -0.5, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, look_x, 0.0,
+                0.0
+            ]
+        );
     }
 }
