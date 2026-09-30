@@ -1,0 +1,24 @@
+{
+  "expressions": {
+    "neutral":   { "eyes": "dot", "mouth": { "shape": "line", "width": 0.35, "open": 0.0, "curve": 0.2 },
+                   "blush": 0, "tears": 0, "sweat": 0, "gloom": 0 },
+    "smile":     { "eyes": "smile", "mouth": { "shape": "line", "width": 0.45, "open": 0.3, "curve": 0.8 } },
+    "laugh":     { "eyes": "smile", "mouth": { "shape": "triangle", "width": 0.5, "open": 0.9, "curve": 0.6 } },
+    "sad":       { "eyes": "sad", "mouth": { "shape": "line", "width": 0.3, "curve": -0.6 } },
+    "cry":       { "eyes": "sad", "mouth": { "shape": "wavy", "width": 0.35, "open": 0.4, "curve": -0.5 }, "tears": 1 },
+    "scared":    { "eyes": "wide", "mouth": { "shape": "wavy", "width": 0.3 }, "sweat": 1 },
+    "surprised": { "eyes": "wide", "mouth": { "shape": "line", "width": 0.2, "open": 0.9, "curve": 0 } },
+    "shy":       { "eyes": "squint", "mouth": { "shape": "cat", "width": 0.3, "curve": 0.3 }, "blush": 1 },
+    "gloomy":    { "eyes": "sad", "mouth": { "shape": "line", "width": 0.25, "curve": -0.3 }, "gloom": 1 },
+    "annoyed":   { "eyes": "squint", "mouth": { "shape": "line", "width": 0.3, "curve": -0.4 } },
+    "sleepy":    { "eyes": "closed", "mouth": { "shape": "line", "width": 0.2, "open": 0.2, "curve": 0 } },
+    "confused":  { "eyes": "dot", "mouth": { "shape": "wavy", "width": 0.35 }, "sweat": 0.5 }
+  },
+  "motions": {
+    "nod":     { "duration_ms": 600,  "intensity": 1.0 },
+    "shake":   { "duration_ms": 600,  "intensity": 1.0 },
+    "sway":    { "duration_ms": 1600, "intensity": 1.0 },
+    "bounce":  { "duration_ms": 700,  "intensity": 1.0 },
+    "tremble": { "duration_ms": 1200, "intensity": 1.0 }
+  }
+}

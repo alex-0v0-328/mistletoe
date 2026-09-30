@@ -7,8 +7,8 @@ use crate::state::{Pose, Snapshot};
 const RADIUS_RATIO: f32 = 0.228;
 /// 描边宽度（物理像素），与窗口大小无关。
 const OUTLINE_PX: f32 = 4.0;
-/// Globals 的字节数：4 个 vec4<f32>。
-const GLOBALS_SIZE: usize = 4 * 16;
+/// Globals 的字节数：5 个 vec4<f32>。
+const GLOBALS_SIZE: usize = 5 * 16;
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -218,6 +218,8 @@ impl Renderer {
 struct Globals {
     /// 宽、高（物理像素）、球半径（像素）、描边宽度（像素）
     screen: [f32; 4],
+    /// 球心相对窗口中心的位移（像素，x 向右、y 向上），后两项未用
+    ball: [f32; 4],
     /// 脸的基向量 U、V、F（视图空间），见 face_basis
     face_u: [f32; 4],
     face_v: [f32; 4],
@@ -227,9 +229,12 @@ struct Globals {
 impl Globals {
     fn new(width: u32, height: u32, pose: Pose) -> Self {
         let (w, h) = (width as f32, height as f32);
+        let radius = RADIUS_RATIO * w.min(h);
         let [u, v, f] = face_basis(pose);
         Self {
-            screen: [w, h, RADIUS_RATIO * w.min(h), OUTLINE_PX],
+            screen: [w, h, radius, OUTLINE_PX],
+            // Pose 的位移以球半径为单位
+            ball: [pose.x * radius, pose.y * radius, 0.0, 0.0],
             face_u: [u[0], u[1], u[2], 0.0],
             face_v: [v[0], v[1], v[2], 0.0],
             face_f: [f[0], f[1], f[2], 0.0],
@@ -239,7 +244,13 @@ impl Globals {
     /// 按字段顺序写成小端字节，布局与 WGSL 一致（全是 vec4<f32>，没有填充）。
     fn to_bytes(&self) -> [u8; GLOBALS_SIZE] {
         let mut out = [0u8; GLOBALS_SIZE];
-        let fields = [self.screen, self.face_u, self.face_v, self.face_f];
+        let fields = [
+            self.screen,
+            self.ball,
+            self.face_u,
+            self.face_v,
+            self.face_f,
+        ];
         for (i, value) in fields.iter().flatten().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
@@ -247,16 +258,21 @@ impl Globals {
     }
 }
 
-/// 由姿态求旋转矩阵 R = Ry(yaw) · Rx(pitch) 的三列：U = R·x̂，V = R·ŷ，F = R·ẑ。
-/// 视图空间：x 向右、y 向上、+z 指向观众。yaw 为正时 F 偏向 +x，pitch 为正时 F 偏向 +y。
+/// 由姿态求旋转矩阵 R = Ry(yaw) · Rx(pitch) · Rz(roll) 的三列：U = R·x̂，V = R·ŷ，F = R·ẑ。
+/// 视图空间：x 向右、y 向上、+z 指向观众。yaw 为正时 F 偏向 +x，pitch 为正时 F 偏向 +y，
+/// roll 为正时脸在自身平面里逆时针转。
 fn face_basis(pose: Pose) -> [[f32; 3]; 3] {
     let (sy, cy) = pose.yaw.sin_cos();
     let (sp, cp) = pose.pitch.sin_cos();
-    [
-        [cy, 0.0, -sy],
-        [-sy * sp, cp, -cy * sp],
-        [sy * cp, sp, cy * cp],
-    ]
+    let (sr, cr) = pose.roll.sin_cos();
+    // 先求 Ry · Rx 的三列
+    let u0 = [cy, 0.0, -sy];
+    let v0 = [-sy * sp, cp, -cy * sp];
+    let f = [sy * cp, sp, cy * cp];
+    // 再乘 Rz(roll)：只在 U、V 构成的脸平面里转，F 不变
+    let u = [0, 1, 2].map(|i| cr * u0[i] + sr * v0[i]);
+    let v = [0, 1, 2].map(|i| -sr * u0[i] + cr * v0[i]);
+    [u, v, f]
 }
 
 #[cfg(test)]
@@ -272,6 +288,8 @@ mod tests {
         let [u, v, f] = face_basis(Pose {
             yaw: 0.4,
             pitch: -0.3,
+            roll: 0.2,
+            ..Pose::default()
         });
         for (a, b) in [(u, v), (v, f), (f, u)] {
             assert!(dot(a, b).abs() < 1e-6);
@@ -281,17 +299,29 @@ mod tests {
         }
         // yaw 为正 → 脸朝右；pitch 为负 → 脸朝下
         assert!(f[0] > 0.0 && f[1] < 0.0);
+        // 只有 roll：脸的“右”转向上方（逆时针）
+        let [u, _, _] = face_basis(Pose {
+            roll: 0.3,
+            ..Pose::default()
+        });
+        assert!(u[1] > 0.0);
     }
 
     #[test]
     fn globals_bytes_follow_field_order() {
-        let bytes = Globals::new(800, 600, Pose::default()).to_bytes();
+        let pose = Pose {
+            y: 0.5,
+            ..Pose::default()
+        };
+        let bytes = Globals::new(800, 600, pose).to_bytes();
         let read = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        let radius = RADIUS_RATIO * 600.0;
         assert_eq!(read(0), 800.0);
         assert_eq!(read(1), 600.0);
-        assert_eq!(read(2), RADIUS_RATIO * 600.0);
-        assert_eq!(read(4), 1.0); // U = x̂
-        assert_eq!(read(9), 1.0); // V = ŷ
-        assert_eq!(read(14), 1.0); // F = ẑ
+        assert_eq!(read(2), radius);
+        assert_eq!(read(5), 0.5 * radius); // 球心上移半个半径
+        assert_eq!(read(8), 1.0); // U = x̂
+        assert_eq!(read(13), 1.0); // V = ŷ
+        assert_eq!(read(18), 1.0); // F = ẑ
     }
 }

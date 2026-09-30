@@ -8,3 +8,5 @@ publish = false
 wgpu = { version = "30", default-features = false, features = ["std", "dx12", "wgsl"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 pollster = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

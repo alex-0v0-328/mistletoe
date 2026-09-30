@@ -4,6 +4,8 @@
 mod api;
 mod app;
 mod render;
+// 第 4 步接入 API 之前，命令接口（Command、Reply、apply）只有单元测试在用
+#[allow(dead_code)]
 mod state;
 
 fn main() {

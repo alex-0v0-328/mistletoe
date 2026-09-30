@@ -31,6 +31,7 @@ impl Follow {
         let target = Pose {
             yaw: p.x * scale,
             pitch: p.y * scale,
+            ..Pose::default()
         };
         let changed = target != self.target;
         self.target = target;

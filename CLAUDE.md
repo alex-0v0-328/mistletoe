@@ -70,7 +70,7 @@ This is a complete translation of the user's original Chinese spec, which was de
 3. The window is a normal resizable window with a title bar and a flat gray background. No transparency. It opens at 360×360 logical pixels, and the ball scales with the window's short side.
 4. Chinese text must render too. Noto Sans SC is subset (GB2312 hanzi plus symbols) and embedded in the exe.
 5. An expression holds until the next command. There is no auto-return to neutral.
-6. A motion plays once by default. `loop: true` repeats it until it is replaced. A new motion replaces the old one; motions do not stack.
+6. A motion plays once by default. `loop: true` repeats it until it is replaced. A new motion replaces the old one; motions do not stack. `stop` is a pseudo-motion that fades the current motion out (added with the user on 2026-09-30, because a loop otherwise had no way to end).
 7. A kaomoji replaces the eyes and mouth only. Blush, tears, sweat and gloom still show. `set_expression` or `set_tag` returns to the native face.
 8. Tag names are English only (`happy`, `no`, `scared`, ...).
 9. The API is a single endpoint: `POST /api` with `{"cmd": "...", ...}`.
@@ -150,13 +150,18 @@ tools/subset_fonts.py  dev-only font subsetting
 
 ### state
 
-- The whole interface is `State::apply(cmd, now) -> Reply` and `State::tick(now) -> Snapshot`. Tests drive both with fake time and a fixed RNG seed.
+- The whole interface is `State::apply(cmd, now) -> Reply`, `State::tick(now) -> Snapshot` and `State::set_pointer(pointer) -> bool`. `now` is seconds since app start (`f64`). Tests drive them with fake time and a fixed RNG seed. `apply` validates everything before mutating, so an error leaves the state untouched.
+- Until step 4 wires the API, `main.rs` puts `#[allow(dead_code)]` on `mod state` because only tests call `apply`. Remove it in step 4.
 - `Expression` fields: `eyes` (`dot`, `smile`, `closed`, `squint`, `wide`, `sad`); `mouth` { `shape` (`line`, `cat`, `triangle`, `wavy`), `width` 0..1, `open` 0..1, `curve` -1..1 (negative = frown) }; overlays `blush`, `tears`, `sweat`, `gloom`, each 0..1.
-- Continuous fields ease over `duration_ms` (default 200). Discrete fields never pop: an eye shape swaps while the eyes are closed in a blink, and a mouth shape swaps at the midpoint of a squash-to-line tween.
+- Continuous fields ease over `duration_ms` (default 200, max 10000) with smoothstep. Discrete fields never pop: an eye shape swaps at the exact moment a blink is fully closed (`Blinker::request` returns that time; a request during the opening phase queues a second blink), and a mouth shape swaps at the midpoint of a fixed 200 ms squash-to-line tween (`Face.mouth_flat` 0..1 tells `render` how flat to draw every mouth shape). `duration_ms: 0` switches everything at once.
 - Blinks come at random intervals of 2–6 s and last about 150 ms. The `blink` command blinks now.
-- Motions: `nod` (pitch), `shake` (yaw), `sway` (roll), `bounce` (vertical offset), `tremble` (fast deterministic jitter, no RNG). Each has `duration_ms`, `intensity` (0..2, default 1) and `loop`. A replaced motion blends out over about 120 ms. Every curve starts and ends at zero so nothing pops. The motion pose is added on top of the mouse-follow pose.
+- Motions: `nod` (pitch), `shake` (yaw), `sway` (roll), `bounce` (vertical offset), `tremble` (fast deterministic jitter, no RNG: sines whose frequencies are rounded to whole cycles per loop, all under 30 Hz so 60 fps does not alias them). Each has `duration_ms` (50..60000), `intensity` (0..2, default from presets) and `loop`. A replaced motion blends out over 120 ms; several can be fading at once. Every curve starts and ends at zero so nothing pops. The motion pose is added on top of the mouse-follow pose.
+- `Pose` is `yaw`, `pitch`, `roll` (radians) plus `x`, `y`, the ball-center offset in ball radii. `render` builds `R = Ry(yaw)·Rx(pitch)·Rz(roll)` and shifts the ball by `(x, y)·radius`.
+- `set_tag` with a tag that has no motion leaves the current motion running, including a looping one. To end it, use `stop`: `MotionName::Stop` has no curve and no presets default, takes no parameters, and `Motion::play` only moves the current motion to the fade-out list. Tags may use it too (the built-in `neutral` tag does). `MotionName::ANIMATED` is the five real motions; `MotionName::ALL` adds `stop` for `list_tags`.
 - Mouse follow works anywhere on the screen. `app` passes the cursor's offset from the window center in units of half the window's short side (unbounded outside the window). The target is `(yaw, pitch) = 30° · (x, y) / sqrt(x² + y² + 1)`: it always points toward the cursor, reaches about 71% of 30° at distance 1, and approaches but never exceeds 30° far away. Smoothing is exponential and frame-rate independent: `x += (target - x) * (1 - exp(-dt / 0.12))`. Once the error drops below 0.001 rad, snap to the target and stop.
-- `Snapshot` also carries `animating: bool` and `next_wakeup: Option<t>` (the next blink) so `app` can sleep.
+- `Snapshot` carries `pose`, `face` (shown eye and mouth shapes, eased values, `mouth_flat`, `blink`), `kaomoji` (text + scale-in 0..1), `animating` and `next_wakeup` (the next random blink) so `app` can sleep.
+- `get_state` reports the target expression plus the face and pose of the last rendered frame, so it shows what is on screen.
+- `Command` uses empty struct variants (`Blink {}`) instead of unit variants so extra fields are rejected too.
 
 ### render
 
@@ -192,7 +197,7 @@ The font chain (all OFL, embedded, subset by `tools/subset_fonts.py`): Noto Sans
 | `set_tag` | `tag` | Apply the tag's preset and motion, if present. Leaves kaomoji mode. |
 | `set_expression` | any of `preset`, `eyes`, `mouth{shape,width,open,curve}`, `blush`, `tears`, `sweat`, `gloom`, `duration_ms` | Merge onto the current target and transition. Leaves kaomoji mode. |
 | `set_kaomoji` | `text`, optional `tag` | Show the text in place of the eyes and mouth, and apply the tag. Empty `text` returns to the native face. |
-| `play_motion` | `motion`, optional `duration_ms`, `intensity`, `loop` | Replace the current motion. |
+| `play_motion` | `motion`, optional `duration_ms`, `intensity`, `loop` | Replace the current motion. `"motion":"stop"` fades the current one out and takes no other fields. |
 | `blink` | none | Blink once now. |
 | `get_state` | none | Current and target expression, kaomoji, motion and its progress, pose, `frames_rendered`, `last_latency_ms`. |
 | `list_tags` | none | Tags, presets, eye and mouth shapes, motion names. The debug page builds its buttons from this. |
@@ -208,7 +213,7 @@ The font chain (all OFL, embedded, subset by `tools/subset_fonts.py`): Noto Sans
 
 ## Data files
 
-`--data <dir>` defaults to `./data`. If a file is missing at startup, use the built-in copy (`include_str!` of the repo's `data/`) and log a warning. The reload thread keeps watching either way. A file that is invalid, or that references an unknown preset or motion, is rejected with a Chinese error (including serde's line and column), and the old table stays live.
+`--data <dir>` defaults to `./data`. If a file is missing at startup, use the built-in copy (`include_str!` of the repo's `data/`, parsed in `app`) and log a warning. Until step 4, `app` always uses the built-in copy. The reload thread keeps watching either way. A file that is invalid, or that references an unknown preset or motion, is rejected with a Chinese error (including serde's line and column), and the old table stays live.
 
 ```json
 // presets.json: every expression preset is applied on top of "neutral", so a tag looks the same every time

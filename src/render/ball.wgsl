@@ -4,6 +4,7 @@
 // 与 render/mod.rs 里的 Globals 逐字节对应；只用 vec4<f32>，避开 WGSL 对齐坑。
 struct Globals {
     screen: vec4<f32>,  // x = 宽，y = 高（物理像素），z = 球半径（像素），w = 描边宽度（像素）
+    ball: vec4<f32>,    // xy = 球心相对窗口中心的位移（像素，y 向上），zw 未用
     face_u: vec4<f32>,  // 脸的“右”方向（视图空间，旋转后的 x 轴）
     face_v: vec4<f32>,  // 脸的“上”方向（旋转后的 y 轴）
     face_f: vec4<f32>,  // 脸的朝向（旋转后的 z 轴）
@@ -43,8 +44,8 @@ fn shade(pixel: vec2<f32>) -> vec3<f32> {
     let radius = g.screen.z;
     let outline = g.screen.w;
 
-    // 像素坐标（原点左上、y 向下）→ 以球心为原点、y 向上的像素偏移
-    let offset = vec2<f32>(pixel.x - size.x * 0.5, size.y * 0.5 - pixel.y);
+    // 像素坐标（原点左上、y 向下）→ 以球心为原点、y 向上的像素偏移（球心 = 窗口中心 + 动作位移）
+    let offset = vec2<f32>(pixel.x - size.x * 0.5, size.y * 0.5 - pixel.y) - g.ball.xy;
     // 正交投影：光线沿 -Z 射入，光线到球心的距离就是偏移的长度
     let d = length(offset);
     if d >= radius + outline {

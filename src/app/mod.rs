@@ -4,7 +4,7 @@
 mod cursor;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -13,7 +13,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::render::Renderer;
-use crate::state::{Pointer, State};
+use crate::state::{Pointer, State, Tables};
 
 /// 动画最高 60 fps：高刷屏上也不按刷新率出帧，省电，慢设备也跑得动。
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -27,12 +27,22 @@ pub fn run() -> Result<(), String> {
     event_loop.set_control_flow(ControlFlow::Wait);
     // 窗口在后台时也接收原始鼠标移动，这样鼠标在窗口外也能跟随；鼠标不动就没有事件，不影响空闲
     event_loop.listen_device_events(DeviceEvents::Always);
+    // 第 4 步改成从 --data 目录读取并热重载；现在用编进程序的默认数据
+    let tables = Tables::parse(
+        include_str!("../../data/presets.json"),
+        include_str!("../../data/tags.json"),
+    )?;
+    // 随机眨眼的种子：每次启动不同就行
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |d| d.as_nanos() as u64);
     let mut app = App {
         start: Instant::now(),
-        state: State::default(),
+        state: State::new(tables, seed, 0.0),
         view: None,
         last_frame: None,
         frame_due: None,
+        wakeup: None,
         error: None,
     };
     event_loop
@@ -49,8 +59,10 @@ struct App {
     view: Option<View>,
     /// 上一帧开始画的时间
     last_frame: Option<Instant>,
-    /// 已排好的下一帧的时间；None = 没有要画的，事件循环可以一直睡
+    /// 已排好的下一帧的时间；None = 没有要画的
     frame_due: Option<Instant>,
+    /// 空闲时要醒来的时刻（下一次自动眨眼）；None = 一直睡到有输入
+    wakeup: Option<Instant>,
     /// 启动阶段的致命错误，退出事件循环后由 run 返回
     error: Option<String>,
 }
@@ -150,9 +162,12 @@ impl ApplicationHandler for App {
                 self.last_frame = Some(Instant::now());
                 let snapshot = self.state.tick(self.start.elapsed().as_secs_f64());
                 view.renderer.draw(&snapshot);
-                // 还在动就排下一帧（最高 60 fps）；停了就什么都不排，事件循环睡到下一个输入
+                // 还在动就排下一帧（最高 60 fps）；停了就睡到下一次眨眼或下一个输入
+                self.wakeup = None;
                 if snapshot.animating {
                     self.schedule_frame();
+                } else if let Some(t) = snapshot.next_wakeup {
+                    self.wakeup = Duration::try_from_secs_f64(t).ok().map(|d| self.start + d);
                 }
             }
             _ => {}
@@ -166,19 +181,25 @@ impl ApplicationHandler for App {
         }
     }
 
-    /// 每轮事件处理完、准备睡眠前调用：到点了就发出重绘，没到点就睡到那一刻。
+    /// 每轮事件处理完、准备睡眠前调用：到点了就发出重绘，没到点就睡到最早要做事的那一刻。
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(view), Some(due)) = (&self.view, self.frame_due) else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
-        };
-        if Instant::now() >= due {
+        let now = Instant::now();
+        // 自动眨眼到点了：排一帧，tick 会开始眨眼
+        if self.wakeup.is_some_and(|at| now >= at) {
+            self.wakeup = None;
+            self.schedule_frame();
+        }
+        if let (Some(view), Some(due)) = (&self.view, self.frame_due)
+            && now >= due
+        {
             self.frame_due = None;
             view.window.request_redraw();
-            event_loop.set_control_flow(ControlFlow::Wait);
-        } else {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(due));
         }
+        let next = match (self.frame_due, self.wakeup) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 }
 
