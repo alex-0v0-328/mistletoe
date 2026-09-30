@@ -6,7 +6,8 @@ mod follow;
 
 use follow::Follow;
 
-/// 指针在窗口里的位置，归一化到 [-1, 1]：窗口中心是 0，x 向右、y 向上，窗口边缘是 ±1。
+/// 指针相对窗口中心的位置，以半个窗口短边为单位：x 向右、y 向上。
+/// 指针在窗口外时可以超出 ±1，没有上限。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pointer {
     pub x: f32,
@@ -34,8 +35,8 @@ pub struct State {
 }
 
 impl State {
-    /// 更新指针位置（None = 指针离开窗口）。返回 true 表示跟随目标变了，需要重绘。
-    pub fn set_pointer(&mut self, pointer: Option<Pointer>) -> bool {
+    /// 更新指针位置。返回 true 表示跟随目标变了，需要重绘。
+    pub fn set_pointer(&mut self, pointer: Pointer) -> bool {
         self.follow.set_pointer(pointer)
     }
 

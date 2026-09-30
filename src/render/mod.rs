@@ -3,8 +3,8 @@
 
 use crate::state::{Pose, Snapshot};
 
-/// 球半径占窗口短边的比例。
-const RADIUS_RATIO: f32 = 0.38;
+/// 球半径占窗口短边的比例：直径约为短边的 46%。
+const RADIUS_RATIO: f32 = 0.228;
 /// 描边宽度（物理像素），与窗口大小无关。
 const OUTLINE_PX: f32 = 4.0;
 /// Globals 的字节数：4 个 vec4<f32>。

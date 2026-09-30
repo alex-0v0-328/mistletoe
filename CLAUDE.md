@@ -27,7 +27,7 @@ This is a complete translation of the user's original Chinese spec, which was de
 - `api`: a local HTTP service that translates JSON commands into operations on `state`.
 - `app`: the window, mouse input and main loop. It ties the other three together.
 
-**Ball.** No mesh. A fullscreen triangle plus a fragment shader computes the ray–sphere intersection directly. The image has three parts: the sphere body, an outer outline, and hard-edged light and shadow. Colors are black, white and gray only. The ball turns smoothly to follow the mouse inside the window.
+**Ball.** No mesh. A fullscreen triangle plus a fragment shader computes the ray–sphere intersection directly. The image has three parts: the sphere body, an outer outline, and hard-edged light and shadow. Colors are black, white and gray only. The ball turns smoothly to follow the mouse anywhere on the screen, inside or outside the window. (The original spec said "inside the window"; the user widened it on 2026-09-30.)
 
 **Expressions.** Expressions are drawn on the ball's "face". Points on the sphere are projected onto the plane the face points toward, and the expression is drawn in that plane, so the face turns naturally with the ball. Native expressions:
 - Eyes: several eye shapes. They blink randomly on their own and can also be made to blink through the API.
@@ -67,7 +67,7 @@ This is a complete translation of the user's original Chinese spec, which was de
 
 1. Skills are project-scoped: this repo only.
 2. Mistletoe runs as a standalone process. Other programs use only the HTTP API. It ships as a single binary crate.
-3. The window is a normal resizable window with a title bar and a flat gray background. No transparency.
+3. The window is a normal resizable window with a title bar and a flat gray background. No transparency. It opens at 360×360 logical pixels, and the ball scales with the window's short side.
 4. Chinese text must render too. Noto Sans SC is subset (GB2312 hanzi plus symbols) and embedded in the exe.
 5. An expression holds until the next command. There is no auto-return to neutral.
 6. A motion plays once by default. `loop: true` repeats it until it is replaced. A new motion replaces the old one; motions do not stack.
@@ -102,7 +102,7 @@ Toolchain verified on 2026-09-30: rustc 1.98.1, stable-x86_64-pc-windows-msvc, V
 | serde (derive) + serde_json | 1.x | JSON commands, tag table, presets |
 | ab_glyph_rasterizer | 0.1.x | Turns glyph outlines into a coverage bitmap; zero dependencies |
 
-Hand-written on purpose: the HTTP/1.1 server (`std::net`), hot reload (mtime polling), the RNG (xorshift), logging (`println!`), and uniform-buffer byte packing (no bytemuck).
+Hand-written on purpose: the HTTP/1.1 server (`std::net`), hot reload (mtime polling), the RNG (xorshift), logging (`println!`), uniform-buffer byte packing (no bytemuck), and the Win32 `GetCursorPos` binding (no windows-sys).
 
 ## Code style
 
@@ -140,6 +140,7 @@ src/api/           local HTTP server; JSON <-> Command; command log
   http.rs          minimal request parsing / response writing
   debug.html       debug page, embedded with include_str!
 src/app/           window, input, main loop, wiring
+  cursor.rs        global cursor position (hand-written GetCursorPos FFI)
   reload.rs        polls data/*.json mtime every 1 s on its own thread
 data/presets.json  named expressions + motion defaults (hot-reloaded)
 data/tags.json     tag -> preset + motion (hot-reloaded)
@@ -154,12 +155,12 @@ tools/subset_fonts.py  dev-only font subsetting
 - Continuous fields ease over `duration_ms` (default 200). Discrete fields never pop: an eye shape swaps while the eyes are closed in a blink, and a mouth shape swaps at the midpoint of a squash-to-line tween.
 - Blinks come at random intervals of 2–6 s and last about 150 ms. The `blink` command blinks now.
 - Motions: `nod` (pitch), `shake` (yaw), `sway` (roll), `bounce` (vertical offset), `tremble` (fast deterministic jitter, no RNG). Each has `duration_ms`, `intensity` (0..2, default 1) and `loop`. A replaced motion blends out over about 120 ms. Every curve starts and ends at zero so nothing pops. The motion pose is added on top of the mouse-follow pose.
-- Mouse follow maps the cursor's offset from the window center to a target yaw/pitch (at most about 30°). Smoothing is exponential and frame-rate independent: `x += (target - x) * (1 - exp(-dt / 0.12))`. When the cursor leaves the window, the target returns to 0. Once the error drops below 0.001 rad, snap to the target and stop.
+- Mouse follow works anywhere on the screen. `app` passes the cursor's offset from the window center in units of half the window's short side (unbounded outside the window). The target is `(yaw, pitch) = 30° · (x, y) / sqrt(x² + y² + 1)`: it always points toward the cursor, reaches about 71% of 30° at distance 1, and approaches but never exceeds 30° far away. Smoothing is exponential and frame-rate independent: `x += (target - x) * (1 - exp(-dt / 0.12))`. Once the error drops below 0.001 rad, snap to the target and stop.
 - `Snapshot` also carries `animating: bool` and `next_wakeup: Option<t>` (the next blink) so `app` can sleep.
 
 ### render
 
-- One fullscreen triangle. Orthographic rays along -Z hit a unit sphere. The background is flat gray.
+- One fullscreen triangle. Orthographic rays along -Z hit a unit sphere. The background is flat gray. The ball's radius is 0.228 of the window's short side (diameter about 46%; the user asked for 3/5 of the original 0.38 on 2026-09-30).
 - Outline: take the ray-to-center distance `d`. If `R <= d < R + w`, the pixel is black; `w` is a fixed pixel width.
 - Shading has two hard tones: `dot(n, L) > k` gives white, otherwise light gray. The light is fixed in view space, at upper left. The palette constants live in one WGSL block, and every output pixel uses one of them (black, white and a few fixed grays).
 - Face: the rotation `R` gives the face basis `F = R·ẑ`, `U = R·x̂`, `V = R·ŷ`. A hit point `P` maps to face coordinates `(P·U, P·V)`. Features draw only where `P·F > 0.2`. Eyes, mouth and overlays are 2D SDFs in face space.
@@ -199,7 +200,10 @@ The font chain (all OFL, embedded, subset by `tools/subset_fonts.py`): Noto Sans
 ### app
 
 - Uses the winit 0.30 `ApplicationHandler` with user events (`AppEvent::Api`, `AppEvent::Reload`). The window and surface are created in `resumed`.
-- Idle: `ControlFlow::Wait` by default. While `snapshot.animating`, request the next redraw (`AutoVsync` paces it). Otherwise set `WaitUntil(next_wakeup)`. A mouse move triggers a redraw only when the follow target changes. Skip rendering while the window is minimized. Use the `LowPower` adapter preference and `MemoryHints::MemoryUsage` (the default `Performance` added about 200 MB on the Intel iGPU).
+- Frame cap: animation runs at most 60 fps on any display (the user's choice, for compatibility with slower devices). `app` never calls `request_redraw` for animation directly. It sets `frame_due = max(now, last_frame + 1/60 s)`, and `about_to_wait` either issues the redraw or sets `WaitUntil(frame_due)`. Only `Resized` and the first frame redraw immediately.
+- Idle: `ControlFlow::Wait` by default. While `snapshot.animating`, schedule the next frame through the cap. Otherwise wait until the earliest of `frame_due` and `next_wakeup`. A mouse move triggers a redraw only when the follow target changes. Skip rendering while the window is minimized. Use the `LowPower` adapter preference and `MemoryHints::MemoryUsage` (the default `Performance` added about 200 MB on the Intel iGPU).
+- Global mouse follow: `listen_device_events(DeviceEvents::Always)` makes winit register raw input with `RIDEV_INPUTSINK`, so raw mouse motion arrives even when the window is in the background. Each motion event (and `CursorMoved`, `Moved`, `Resized`, startup) reads the absolute position with `GetCursorPos`, subtracts `inner_position()`, and hands the result to `state`. No polling timer: a still mouse produces no events. Raw deltas are only a wake-up signal because they skip pointer acceleration.
+- While the mouse moves anywhere on screen the ball animates. Measured on the dev machine (240 Hz display): 5–14% of one core uncapped, 4–9% with the 60 fps cap (noisy). Idle is still 0.
 - Keep the console subsystem (no `windows_subsystem = "windows"`) so the log is visible.
 
 ## Data files
